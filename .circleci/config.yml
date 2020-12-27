@@ -1,0 +1,427 @@
+//*****************************************************************************
+//
+// ti_master.c - Example demonstrating how to configure SSI2 in TI master mode.
+//
+// Copyright (c) 2010-2017 Texas Instruments Incorporated.  All rights reserved.
+// Software License Agreement
+//
+// This is part of revision 2.1.4.178 of the Tiva Firmware Development Package.
+//
+//*****************************************************************************
+
+#include <stdbool.h>
+#include <stdint.h>
+#include "inc/hw_gpio.h"
+#include "inc/hw_ints.h"
+#include "inc/hw_nvic.h"
+#include "inc/hw_memmap.h"
+#include "inc/hw_types.h"
+#include "driverlib/debug.h"
+#include "driverlib/fpu.h"
+#include "driverlib/gpio.h"
+#include "driverlib/interrupt.h"
+#include "driverlib/pin_map.h"
+#include "driverlib/rom.h"
+#include "driverlib/pwm.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/systick.h"
+#include "driverlib/uart.h"
+#include "utils/uartstdio.h"
+#include "driverlib/adc.h"
+#include "driverlib/timer.h"
+#include "math.h"
+#include "driverlib/ssi.h"
+#include "driverlib/qei.h"
+
+//*****************************************************************************
+//
+//! \addtogroup ssi_examples_list
+//! <h1>TI Master (ti_master)</h1>
+//!
+//! This example shows how to configure the SSI0 as TI Master.  The code will
+//! send three characters on the master Tx then poll the receive FIFO until
+//! 3 characters are received on the master Rx.
+//!
+//! This example uses the following peripherals and I/O signals.  You must
+//! review these and change as needed for your own board:
+//! - SSI2 peripheral
+//! - GPIO Port B peripheral (for SSI2 pins)
+//! - SSI2Clk - PB4
+//! - SSI2Fss - PB5
+//! - SSI2Rx  - PB6
+//! - SSI2Tx  - PB7
+//!
+//! The following UART signals are configured only for displaying console
+//! messages for this example.  These are not required for operation of I2C0.
+//! - UART0 peripheral
+//! - GPIO Port A peripheral (for UART0 pins)
+//! - UART0RX - PA0
+//! - UART0TX - PA1
+//!
+//! This example uses the following interrupt handlers.  To use this example
+//! in your own application you must add these interrupt handlers to your
+//! vector table.
+//! - None.
+//
+//*****************************************************************************
+
+//*****************************************************************************
+//
+// Number of bytes to send and receive.
+//
+//*****************************************************************************
+#define NUM_SSI_DATA            50
+//*****************************************************************************
+//
+// Global variables used in interrupt handler and the main loop.
+//
+//*****************************************************************************
+volatile unsigned long g_ulSSI2RXFF = 0, g_ulSSI2TXFF = 0;
+
+uint32_t pui32DataTx[NUM_SSI_DATA] = {0};
+uint32_t pui32DataRx[NUM_SSI_DATA] = {0};
+uint32_t ulDataTx0[NUM_SSI_DATA] = {0};
+uint32_t ulDataRx0[NUM_SSI_DATA] = {0};
+uint32_t ui32DataRx1[NUM_SSI_DATA] = {0};
+
+volatile uint32_t g_ui32ExpectedFIFOData = 11;
+volatile uint32_t g_ui32Index = 0;
+
+
+uint32_t TxFlag = 0;
+uint32_t count = 0;
+uint32_t len = 0;
+uint32_t RxFlag = 0;
+
+//*****************************************************************************
+//
+// This function sets up UART0 to be used for a console to display information
+// as the example is running.
+//
+//*****************************************************************************
+void
+InitConsole(void)
+{
+    //
+    // Enable UART0 so that we can configure the clock.
+    //
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
+
+    //
+    // Enable GPIO port A which is used for UART0 pins.
+    // TODO: change this to whichever GPIO port you are using.
+    //
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+
+    //
+    // Configure the pin muxing for UART0 functions on port A0 and A1.
+    // This step is not necessary if your part does not support pin muxing.
+    // TODO: change this to select the port/pin you are using.
+    //
+    GPIOPinConfigure(GPIO_PA0_U0RX);
+    GPIOPinConfigure(GPIO_PA1_U0TX);
+
+    //
+    // Use the internal 16MHz oscillator as the UART clock source.
+    //
+    UARTClockSourceSet(UART0_BASE, UART_CLOCK_PIOSC);
+
+    //
+    // Select the alternate (UART) function for these pins.
+    // TODO: change this to select the port/pin you are using.
+    //
+    GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
+
+    //
+    // Initialize the UART for console I/O.
+    //
+    UARTStdioConfig(0, 115200, 16000000);
+
+}
+//*****************************************************************************
+//
+// Configure SSI2 in Master TI mode.  This example will send out 10 bytes of
+// data, then wait for 3 bytes of data to come in.  This will all be done using
+// the interrupt method.
+//
+//*****************************************************************************
+void
+InitSSI2(void)
+{
+    //
+    // The SSI0 peripheral must be enabled for use.
+    //
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_SSI2);
+
+    //
+    // For this example SSI2 is used with PortA[5:2].  The actual port and
+    // pins used may be different on your part, consult the data sheet for
+    // more information.  GPIO port A needs to be enabled so these pins can
+    // be used.
+    // TODO: change this to whichever GPIO port you are using.
+    //
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+
+    //
+    //
+    // Configure the pin muxing for SSI2 functions on port A2, A3, A4, and A5.
+    // This step is not necessary if your part does not support pin muxing.
+    // TODO: change this to select the port/pin you are using.
+    //
+
+    GPIOPinConfigure(GPIO_PB4_SSI2CLK);
+    GPIOPinConfigure(GPIO_PB5_SSI2FSS);
+    GPIOPinConfigure(GPIO_PB6_SSI2RX);
+    GPIOPinConfigure(GPIO_PB7_SSI2TX);
+
+    //
+    // Configure the GPIO settings for the SSI pins.  This function also gives
+    // control of these pins to the SSI hardware.  Consult the data sheet to
+    // see which functions are allocated per pin.
+    // The pins are assigned as follows:
+    //      PB7 - SSI0Tx
+    //      PB6 - SSI0Rx
+    //      PB5 - SSI0Fss
+    //      PB4 - SSI0CLK
+    // TODO: change this to select the port/pin you are using.
+    //
+    GPIOPinTypeSSI(GPIO_PORTB_BASE,GPIO_PIN_7|GPIO_PIN_6|GPIO_PIN_5|GPIO_PIN_4);
+
+
+    //
+    // Configure and enable the SSI port for TI master mode.  Use SSI2, system
+    // clock supply, master mode, 1MHz SSI frequency, and 8-bit data.
+    //
+    SSIConfigSetExpClk(SSI2_BASE, SysCtlClockGet(),SSI_FRF_MOTO_MODE_0,SSI_MODE_MASTER,10000, 8);
+
+    //
+    // Enable SSI2 module
+    //
+    SSIEnable(SSI2_BASE);
+
+    SSIIntEnable(SSI2_BASE,SSI_RXFF);
+
+    //
+    // Read any residual data from the SSI port.  This makes sure the receive
+    // FIFOs are empty, so we don't read any unwanted junk.  This is done here
+    // because the TI SSI mode is full-duplex, which allows you to send and
+    // receive at the same time.  The SSIDataGetNonBlocking function returns
+    // "true" when data was returned, and "false" when no data was returned.
+    // The "non-blocking" function checks if there is any data in the receive
+    // FIFO and does not "hang" if there isn't.
+    //
+    while(SSIDataGetNonBlocking(SSI2_BASE, &pui32DataRx[0]))
+    {
+    }
+}
+
+//*****************************************************************************
+//
+// Interrupt handler for SSI2 peripheral in slave mode.  It reads the interrupt
+// status and if the interrupt is fired by a RX time out interrupt it reads the
+// SSI2 RX FIFO and increments a counter to tell the main loop that RX timeout
+// interrupt was fired.
+//
+//*****************************************************************************
+void SSI2IntHandler(void)
+{
+    uint32_t ulStatus, ui32Index;
+
+        //
+        // Read interrupt status.
+        //
+        ulStatus = SSIIntStatus(SSI2_BASE, 1);
+
+        //
+        // Check the reason for the interrupt.
+        //
+        if((ulStatus & SSI_RXFF) == SSI_RXFF)
+        {
+            //
+            // Clear the interrupt
+            //
+            SSIIntClear(SSI2_BASE, SSI_RXFF);
+
+            //
+            // Receive First byte from SSI2 Bus
+            //
+            SSIDataGetNonBlocking(SSI2_BASE, &pui32DataRx[g_ui32Index++]);
+
+
+            //
+            // Check first byte is valid or not
+            //
+            if(pui32DataRx[0] == g_ui32ExpectedFIFOData)
+            {
+
+                //
+                // Receive the data using the "blocking" Get function. This function
+                // will wait until there is data in the receive FIFO before returning.
+                while(SSIDataGetNonBlocking(SSI2_BASE, &pui32DataRx[g_ui32Index++]));
+
+                //
+                // Wait until SSI2 is done receiving all the data in the receive FIFO.
+                //
+                while(SSIBusy(SSI2_BASE));
+
+                //
+                // Receive flag indicates the reception is completed
+                //
+                g_ulSSI2RXFF++;
+                g_ui32Index--;
+
+            }
+
+
+            else
+            {
+                while(SSIDataGetNonBlocking(SSI2_BASE, &ulDataRx0[0]))
+                {
+                }
+
+                g_ui32Index = 0;
+            }
+        }
+
+        // Clear interrupts.
+        //
+        SSIIntClear(SSI2_BASE, ulStatus);
+
+}
+
+//*****************************************************************************
+//
+// This function is used to send multiple bytes of data over SSI2 bus
+//
+//*****************************************************************************
+void
+Send (uint32_t ulDataTx0[])
+{
+    uint32_t ui32Index;
+
+    //
+    // Transmit 10 bytes of  data over SSI2 Bus
+    //
+    for(ui32Index = 0; ui32Index < NUM_SSI_DATA; ui32Index++)
+    {
+        //
+        // Load transmitted data into transmitted FIFO
+        //
+        pui32DataTx[ui32Index] = ulDataTx0[ui32Index];
+
+        //
+        // Send the data using the "blocking" put function.  This function
+        // will wait until there is room in the send FIFO before returning.
+        // This allows you to assure that all the data you send makes it into
+        // the send FIFO.
+        //
+        SSIDataPutNonBlocking(SSI2_BASE, pui32DataTx[ui32Index]);
+
+        UARTprintf("pui32DataTx[%d] = %d\n",ui32Index,pui32DataTx[ui32Index]);
+
+    }
+
+    //
+    // Wait until SSI2 is done transferring all the data in the transmit FIFO.
+    //
+    while(SSIBusy(SSI2_BASE))
+    {
+    }
+
+    UARTprintf("SPI Master Transmission is Done....\n\n");
+
+
+}
+
+
+//*****************************************************************************
+//
+// This function is used to receive the multiple bytes of data and prints on to
+// the console screen
+//
+//*****************************************************************************
+void
+Ask (void)
+{
+    uint32_t count = 0;
+
+    if(g_ulSSI2RXFF)
+    {
+        if (pui32DataRx[49] == 60)
+        {
+            for(count = 0; count < NUM_SSI_DATA; count++)
+            {
+               // ui32DataRx1[count]  = pui32DataRx[count];
+
+                //
+                // Display the data that SSI2 received.
+                //
+                UARTprintf("pui32DataRx[%d] = %d \n", count,pui32DataRx[count]);
+
+            }
+
+            UARTprintf("SPI Master Receiving is Done....\n\n");
+
+            g_ui32Index = 0;
+            g_ui32ExpectedFIFOData = 11;
+        }
+        g_ulSSI2RXFF = 0;
+    }
+
+
+
+}
+
+
+//*****************************************************************************
+//
+// Main function entry starts here
+//
+//*****************************************************************************
+int
+main(void)
+{
+    //
+    // Set the clocking to run directly from the external crystal/oscillator.
+    // TODO: The SYSCTL_XTAL_ value must be changed to match the value of the
+    // crystal on your board.
+    //
+
+    SysCtlClockSet(SYSCTL_SYSDIV_4 | SYSCTL_USE_OSC | SYSCTL_OSC_MAIN |
+            SYSCTL_XTAL_16MHZ);
+
+
+    //
+    // Set up the serial console to use for displaying messages.  This is
+    // just for this example program and is not needed for SSI operation.
+    //
+    InitConsole();
+    //
+    // Display the setup on the console.
+    //
+    UARTprintf("SSI ->\n");
+    UARTprintf("  Mode: TI\n");
+    UARTprintf("  Data: 8-bit\n\n");
+
+    for(count = 0; count < NUM_SSI_DATA; count++)
+    {
+        ulDataTx0[count] = count + 1;
+    }
+
+    InitSSI2();
+    IntEnable(INT_SSI2);
+    IntMasterEnable();
+
+
+    while(1)
+    {
+
+
+        Send(ulDataTx0);
+        SysCtlDelay(200000);
+        Ask();
+
+
+    }
+
+}
